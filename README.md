@@ -16,19 +16,39 @@ npm run validate -- --input data/inbox.json --output output.json --trace .trace/
 Both commands also work without flags (defaults match the lines above).
 `npm run typecheck` runs `tsc --noEmit`.
 
-Expected runtime is well under a second for the visible 8-item batch
-(no LLM calls).
+Expected runtime is under a second for the visible 8-item batch on the
+deterministic path. With the optional LLM summary enabled (see below),
+add ~1-2s for the Claude Haiku call.
+
+### Optional: LLM-generated batch summary
+
+After triage completes, the agent prints a "morning huddle" summary to
+**stderr**. By default this is a deterministic counts block. If you
+set `ANTHROPIC_API_KEY` (copy `.env.example` to `.env` and fill it in),
+the same stats are passed to Claude Haiku 4.5 which produces a 100-150
+word natural-language briefing instead.
+
+The summary is strictly stderr-only - it never touches `output.json`
+or the audit trace, so the validator behaves identically with or
+without the key. If the API call fails for any reason (auth, network,
+malformed response), it logs the error and falls back to the
+deterministic summary - the triage run itself never fails because of
+a summary issue.
 
 ## 2. Stack and runtime
 
 - **Language**: TypeScript (`type: module`, Node LTS, tsx loader).
-- **Dependencies**: only the starter set - `ajv` / `ajv-formats` for the
-  validator, `tsx` to run TS without a build step, `ulid` for trace IDs.
-- **No LLM at runtime**. Classification and intake extraction are
-  deterministic regex / decision-tree code so the output is auditable
-  and reproducible against the hidden synthetic variants reviewers may
-  run. (Claude Code was used at *build* time to scaffold and refine the
-  agent.)
+- **Dependencies**:
+  - Starter: `ajv` / `ajv-formats` for the validator, `tsx` to run TS
+    without a build step, `ulid` for trace IDs.
+  - Added: `@anthropic-ai/sdk` for the optional LLM summary path
+    (dynamically imported so it's a no-op when the env var is absent).
+- **LLM usage**: the **core triage logic is fully deterministic**
+  (regex extraction + decision-tree classification + template drafts)
+  so the output is auditable and reproducible against the hidden
+  synthetic variants reviewers may run. The LLM is used in exactly
+  one place: a stderr-only batch summary that never affects the
+  validated output.
 - **Tools**: the eight starter mocks in `src/tools.ts` are used
   unmodified. Every tool call goes through `withItemContext` and the
   reported `tools_called` array is read straight from
@@ -39,51 +59,43 @@ Assumptions:
   runs (not the latest `received_at`), so tasks render with sensible
   forward-looking dates regardless of when reviewers execute it.
 - Recipients prefer email when available, then phone, then a
-  free-text fallback - the mock `draft_message` accepts any string.
+  free-text fallback.
 - Every output item is flagged `requires_human_review: true`. The
   validator requires this and it matches Origin's product framing -
   the agent drafts, surfaces, and holds; humans decide.
 
 ## 3. Architecture
 
-`src/agent.ts` is the only file changed beyond starter scaffolding.
-It is organised top-down into clearly labelled sections:
+The agent is split into focused modules under `src/agent/` so each
+file has a single responsibility and is easy to extend in isolation.
+`src/agent.ts` is a thin orchestrator (~200 lines).
 
-1. **Constants** - named values for urgency, classification, assignee,
-   policy topic, channels, due-date offsets, keyword lists, payer
-   phrases, and blank markers. Nothing inline below this point uses
-   magic strings.
-2. **Date and string helpers** - `batchAnchor`, `dueDateString`,
-   blank-marker check, regex escape, trailing-dot stripper.
-3. **Intake extraction** - one extractor per `ExtractedIntake` field.
-   Each is best-effort regex with documented fallback order; missing
-   values become `null` and surface in `missing_info`.
-4. **Signal detection** - pure functions that report safeguarding,
-   clinical-question, scheduling/reschedule, Spanish-language
-   preference, incomplete-referral, and generic new-intake signals.
-5. **Classification (`classifyItem`)** - explicit decision tree that
-   maps an item + intake onto an initial `(classification, urgency,
-   rationaleSeed)`. Safeguarding is checked first so a safety signal
-   buried in a routine eval request still escalates.
-6. **Safe tool wrapper (`safeCall`)** - every tool call goes through
-   this so a single tool failure doesn't crash the batch; the failure
-   note is folded into `decision_rationale`.
-7. **Draft message templates** - English and Spanish acknowledgements
-   for in-network, out-of-network/expired, unknown-insurance,
-   safeguarding, clinical-question deflection, and reschedule cases.
-   They never give clinical advice and never imply the message was
-   sent.
-8. **Per-classification handlers** - `handleSafeguarding`,
-   `handleClinicalQuestion`, `handleMissingPaperwork`,
-   `handleScheduling`, `handleNewReferral` (with sub-flows
-   `handleBenefitsConversation`, `handleInNetworkReferral`,
-   `handleIdentityVerification`, `handleUnknownInsurance`), and
-   `handleOther`. All return the same `HandlerOutcome` shape.
-9. **`triageItem` / `runAgent`** - dispatcher, output assembler, and
-   public entry point. Sequential processing keeps the trace
-   deterministic.
+```
+src/
+├── agent.ts                          # runAgent, triageItem orchestration
+├── agent/
+│   ├── constants.ts                  # named enums + keyword lists
+│   ├── utils.ts                      # date + string helpers
+│   ├── safe-call.ts                  # safe tool-call wrapper
+│   ├── extraction.ts                 # intake field extractors
+│   ├── signals.ts                    # signal detectors
+│   ├── classification.ts             # classifyItem decision tree
+│   ├── drafts.ts                     # message templates + pickers
+│   ├── summary.ts                    # stderr batch summary (det + LLM)
+│   └── handlers/
+│       ├── index.ts                  # dispatchHandler
+│       ├── shared.ts                 # HandlerCtx, HandlerOutcome, helpers
+│       ├── safeguarding.ts           # P0 flow
+│       ├── scheduling.ts             # P1 flow
+│       ├── clinical-question.ts      # P2 - deflect to screening
+│       ├── missing-paperwork.ts      # P2 - callback the referring office
+│       ├── new-referral.ts           # P2 - main intake flow + sub-flows
+│       └── other.ts                  # P2 fallback
+```
 
-Decision-tree summary (priority of checks):
+Decision-tree summary (priority of checks, see
+[src/agent/classification.ts](src/agent/classification.ts)):
+
 - safeguarding language present -> **P0 safeguarding** (policy lookup,
   escalate, clinical-lead task, neutral acknowledgement).
 - reschedule / illness / no-show language -> **P1 scheduling**
@@ -111,6 +123,16 @@ Decision-tree summary (priority of checks):
 Tool orchestration across the visible batch uses **all eight** of the
 provided tools: `search_patient`, `verify_insurance`, `lookup_policy`,
 `find_slots`, `hold_slot`, `create_task`, `draft_message`, `escalate`.
+
+### Adding a new classification
+
+The module layout makes this a 5-step touch:
+
+1. Add the constant in [`agent/constants.ts`](src/agent/constants.ts) under `CLASSIFICATION`.
+2. Add a detector function in [`agent/signals.ts`](src/agent/signals.ts).
+3. Add the check to `classifyItem` in [`agent/classification.ts`](src/agent/classification.ts) in the right priority slot.
+4. Add a handler file in [`agent/handlers/`](src/agent/handlers/) following the existing handler shape.
+5. Add the case to `dispatchHandler` in [`agent/handlers/index.ts`](src/agent/handlers/index.ts).
 
 ## 4. Failure modes and production eval
 
@@ -148,20 +170,28 @@ Known failure modes that staff or evals should watch for:
   records it in `decision_rationale` (`Tool warnings: ...`). The item
   still produces output and is still routed for human review. Per-item
   tool-failure rate is a production health signal.
+- **LLM summary regressions** - if the optional LLM summary
+  hallucinates an action or invents an item_id, that's misleading to
+  staff. The system prompt constrains it to the JSON we feed it, but
+  in production this output should be evaluated against the
+  deterministic summary on a sample.
 
 A reasonable production eval would be: a held-out hand-labelled set
 with safeguarding precision/recall, classification accuracy, per-field
-intake F1, and a "would staff have accepted the draft as-is" rating.
-Run nightly; alert on safeguarding recall regressions.
+intake F1, "would staff have accepted the draft as-is" rating, and
+LLM-summary faithfulness against the underlying JSON. Run nightly;
+alert on safeguarding recall regressions.
 
 ## 5. What I chose not to build, and why
 
-- **No runtime LLM**. The brief allows but doesn't require it.
-  Deterministic code makes the output reproducible, easy to audit, and
-  testable against hidden synthetic variants without depending on a
-  reviewer-provided API key. An LLM would help most on safeguarding
-  recall and on naturalising draft replies - both worth doing later,
-  neither blocking for the prototype.
+- **No LLM in the core triage path**. The deterministic decision
+  tree + template drafts make outputs reproducible against hidden
+  synthetic variants and easy to audit. The LLM is reserved for the
+  one place where it's safe and obviously additive (the stderr batch
+  summary) and is always gated behind `ANTHROPIC_API_KEY`. An LLM in
+  the safeguarding classifier or draft generator would help recall
+  and naturalness but is too risky without an eval set - clinical
+  advice slipping into drafts is a clear policy violation.
 - **No `hold_slot` for the clean English in-network cases.** Holding
   a slot before staff confirms the family's preference is performative
   and would clutter staff queues. I reserve `hold_slot` for the case
@@ -179,9 +209,9 @@ Run nightly; alert on safeguarding recall regressions.
 - **No multi-discipline split.** Items only request one discipline in
   the visible set; if more than one is detected, the task notes
   surface it for staff to handle.
-- **No unit tests.** Within the 2-hour budget I prioritised end-to-end
-  validator pass plus careful per-item walk-throughs. The handlers are
-  small enough that adding fixture-based tests later is straightforward.
+- **No unit tests.** Within the time budget I prioritised end-to-end
+  validator pass plus careful per-item walk-throughs. The module
+  split makes adding fixture-based tests later straightforward.
 - **No anonymisation or PHI scrubbing.** All data is synthetic per the
   brief; production would route through a PHI-safe channel before any
   external LLM call.
@@ -189,14 +219,15 @@ Run nightly; alert on safeguarding recall regressions.
 ## 6. What I would do with another 4 hours
 
 1. **LLM-assisted safeguarding classifier with a strict precision
-   floor.** Layer a small Claude/GPT-class classifier on top of the
-   keyword detector, accept only high-confidence safeguarding flags,
-   keep the keyword detector as a recall safety net. Evaluate on a
+   floor.** Layer a small Claude classifier on top of the keyword
+   detector, accept only high-confidence safeguarding flags, keep the
+   keyword detector as a recall safety net. Evaluate on a
    hand-labelled set.
 2. **LLM-naturalised drafts** with the policy/intake template as a
-   constrained prompt. The current templates are operationally correct
-   but stiff; LLM rewriting with a policy-checking pass would land
-   closer to what staff would actually send.
+   constrained prompt + a policy-check pass. The current templates
+   are operationally correct but stiff; LLM rewriting with a
+   policy-checking pass would land closer to what staff would
+   actually send.
 3. **Field-level eval harness** - hand-label intake fields on a 30-50
    item sample and add a `npm run eval` that reports field-level
    precision/recall plus classification accuracy.
@@ -207,13 +238,13 @@ Run nightly; alert on safeguarding recall regressions.
 5. **Patient deduplication** - when `search_patient` returns no match
    but name + DOB look plausible, run a fuzzier search and flag
    "possible match: <name>" so intake doesn't create duplicate records.
-6. **Trace observability** - emit a per-batch summary (counts by
-   classification/urgency, tool failure rate, top missing-info fields)
-   to stdout at the end of `npm run triage` so smoke-testing is fast.
+6. **Per-handler unit tests** with a mocked `tools.ts` - the module
+   split already shapes the code for this.
 7. **Provider-preference ranking** - currently `find_slots` returns
    the mock's first match. For each in-network referral, rank slots
    against extracted `preferences` (time-of-day, day-of-week) before
    surfacing.
-8. **Tests** - fixture-based snapshot tests on each handler with a
-   tiny mocked `tools.ts`, plus a property test that
-   `requires_human_review` is always true.
+8. **Faithfulness check on the LLM summary** - after generating, do a
+   second pass that asserts every item_id mentioned actually exists
+   in the input and every action attributed matches the JSON. Reject
+   and fall back if it fails.
