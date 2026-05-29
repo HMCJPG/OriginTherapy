@@ -436,9 +436,16 @@ async function handleIdentityVerification(
     patientMatch,
   } = ctx;
 
-  // Strip trailing punctuation from "Mateo Ramirez Jr." etc. so the
-  // sentence-ending period doesn't double up.
-  const patientLabel = patientMatch.name.replace(/[.\s]+$/, "");
+  // PRIVACY: the caller's identity is not yet confirmed, so the
+  // family-facing draft uses the name *as the caller wrote it*, not
+  // the stored patient name. Otherwise we'd leak the suffix (e.g.
+  // "Mateo Ramirez" -> "Mateo Ramirez Jr.") and effectively confirm
+  // we have a matching patient on file to an unverified caller.
+  // Staff-facing fields (task title, notes, decision_rationale) keep
+  // the full stored name so staff can act on it.
+  const familyFacingName =
+    intake.child_name?.replace(/[.\s]+$/, "") ?? "your child";
+  const storedPatientLabel = patientMatch.name.replace(/[.\s]+$/, "");
 
   const taskNotes = `Existing patient ${patientMatch.name} (${patientMatch.patient_id}) has stored guardian "${patientMatch.guardian_name}" but the inbound contact is "${intake.parent_contact}". Insurance verified${insurancePlan ? ` (${insurancePlan})` : ""}. Confirm caller identity before opening a new referral or sharing patient information; reach the stored guardian if needed.`;
 
@@ -447,14 +454,14 @@ async function handleIdentityVerification(
     () =>
       create_task({
         assignee: ASSIGNEE.INTAKE,
-        title: `Verify caller identity for ${patientMatch.name}`,
+        title: `Verify caller identity for ${storedPatientLabel}`,
         due: dueDateString(anchor, DUE_OFFSET_DAYS.NEXT_DAY),
         notes: taskNotes,
       }),
     errors,
   );
 
-  const draftBody = draftIdentityVerificationDraft({ intake, language }, patientLabel);
+  const draftBody = draftIdentityVerificationDraft({ intake, language }, familyFacingName);
   const draftResult = await safeCall(
     "draft_message",
     () =>

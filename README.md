@@ -5,6 +5,24 @@ prototype agent for a fictional practice, Cedar Kids Therapy, that triages a
 shared inbox of fax referrals, parent voicemails, parent-portal messages, and
 emails into a sorted, human-reviewable action plan.
 
+> **Iteration based on reviewer feedback** — two changes since the
+> initial submission:
+> 1. **Semantic safety net** for paraphrased signals. A Claude-Haiku
+>    layer ([`src/agent/semantic-enrichment.ts`](src/agent/semantic-enrichment.ts))
+>    re-examines items the keyword classifier left as `new_referral` /
+>    `other` and upgrades them on high confidence only. Gated on
+>    `ANTHROPIC_API_KEY`; soft-fails to keyword-only on any error.
+>    The keyword classifier is always the recall floor (it can flag
+>    things the LLM is skipped on), and the LLM only ever upgrades,
+>    never downgrades. Detail in §2 and §3.
+> 2. **Privacy fix in the identity-verification draft.** When
+>    `search_patient` returns a match whose attributes (name suffix,
+>    guardian) diverge from the inbound referral, the family-facing
+>    `draft_reply` now uses the child's name *as the caller wrote it*
+>    instead of the stored patient name. We no longer leak stored
+>    details to an unverified caller. Staff-facing fields (task
+>    title, notes, rationale) keep the full stored name. Detail in §3.
+
 ## 1. How to run
 
 ```bash
@@ -43,12 +61,20 @@ a summary issue.
     without a build step, `ulid` for trace IDs.
   - Added: `@anthropic-ai/sdk` for the optional LLM summary path
     (dynamically imported so it's a no-op when the env var is absent).
-- **LLM usage**: the **core triage logic is fully deterministic**
-  (regex extraction + decision-tree classification + template drafts)
-  so the output is auditable and reproducible against the hidden
-  synthetic variants reviewers may run. The LLM is used in exactly
-  one place: a stderr-only batch summary that never affects the
-  validated output.
+- **LLM usage**: the **deterministic keyword classifier is the
+  baseline** (regex extraction + decision tree + template drafts) so
+  the output is auditable and reproducible. The LLM is used in two
+  scoped places, both gated on `ANTHROPIC_API_KEY`:
+  1. A **semantic safety net** ([`src/agent/semantic-enrichment.ts`](src/agent/semantic-enrichment.ts))
+     that runs Claude Haiku over items the keyword classifier left as
+     `new_referral` / `other` and upgrades them to safeguarding /
+     scheduling / clinical_question on **high confidence only**. It
+     never downgrades the keyword classifier's decision; the keyword
+     classifier is always the recall floor. Soft-fails to keyword-only
+     on any error.
+  2. A **stderr-only batch summary** ([`src/agent/summary.ts`](src/agent/summary.ts))
+     that produces a "morning huddle" briefing. Never touches
+     `output.json` or the trace.
 - **Tools**: the eight starter mocks in `src/tools.ts` are used
   unmodified. Every tool call goes through `withItemContext` and the
   reported `tools_called` array is read straight from
@@ -81,6 +107,7 @@ src/
 │   ├── signals.ts                    # signal detectors
 │   ├── classification.ts             # classifyItem decision tree
 │   ├── drafts.ts                     # message templates + pickers
+│   ├── semantic-enrichment.ts        # optional LLM safety net (paraphrased signals)
 │   ├── summary.ts                    # stderr batch summary (det + LLM)
 │   └── handlers/
 │       ├── index.ts                  # dispatchHandler
@@ -118,7 +145,12 @@ Decision-tree summary (priority of checks, see
   - search_patient hit -> classification upgrades to
     `existing_patient_request`. If the stored guardian name disagrees
     with the inbound contact we route through
-    `handleIdentityVerification` instead of scheduling.
+    `handleIdentityVerification` instead of scheduling. **Privacy
+    note**: the family-facing draft in that path uses the child's
+    name *as the caller wrote it*, not the stored patient name, so
+    we don't confirm or expand stored details (e.g. "Mateo Ramirez"
+    -> "Mateo Ramirez Jr.") to an unverified caller. Staff-facing
+    task title and notes keep the full stored name.
 
 Tool orchestration across the visible batch uses **all eight** of the
 provided tools: `search_patient`, `verify_insurance`, `lookup_policy`,
@@ -184,14 +216,16 @@ alert on safeguarding recall regressions.
 
 ## 5. What I chose not to build, and why
 
-- **No LLM in the core triage path**. The deterministic decision
-  tree + template drafts make outputs reproducible against hidden
-  synthetic variants and easy to audit. The LLM is reserved for the
-  one place where it's safe and obviously additive (the stderr batch
-  summary) and is always gated behind `ANTHROPIC_API_KEY`. An LLM in
-  the safeguarding classifier or draft generator would help recall
-  and naturalness but is too risky without an eval set - clinical
-  advice slipping into drafts is a clear policy violation.
+- **No LLM-rewritten drafts**. The templates are operationally
+  correct and policy-compliant. An LLM rewrite would help
+  naturalness but risks slipping clinical advice or implying actions
+  staff didn't authorise. Out of scope without a policy-check pass
+  and an eval set.
+- **LLM safety net only upgrades, never downgrades.** The keyword
+  classifier is always the recall floor. If the keyword classifier
+  flags safeguarding, the safety net is skipped entirely - we never
+  let an LLM decide *not* to escalate. High-confidence-only override
+  is the precision floor that keeps over-escalation in check.
 - **No `hold_slot` for the clean English in-network cases.** Holding
   a slot before staff confirms the family's preference is performative
   and would clutter staff queues. I reserve `hold_slot` for the case
@@ -218,11 +252,11 @@ alert on safeguarding recall regressions.
 
 ## 6. What I would do with another 4 hours
 
-1. **LLM-assisted safeguarding classifier with a strict precision
-   floor.** Layer a small Claude classifier on top of the keyword
-   detector, accept only high-confidence safeguarding flags, keep the
-   keyword detector as a recall safety net. Evaluate on a
-   hand-labelled set.
+1. **Eval set for the safety net.** The LLM safety net currently uses
+   a hard-coded `confidence === "high"` threshold. With a hand-labelled
+   set (50-100 items including paraphrased safeguarding cases) we can
+   measure precision/recall at each threshold and tune deliberately
+   rather than by intuition.
 2. **LLM-naturalised drafts** with the policy/intake template as a
    constrained prompt + a policy-check pass. The current templates
    are operationally correct but stiff; LLM rewriting with a

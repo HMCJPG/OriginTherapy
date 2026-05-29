@@ -67,6 +67,7 @@ import { CLASSIFICATION, FALLBACK_NEXT_ACTION, URGENCY } from "./agent/constants
 import { classifyItem } from "./agent/classification.js";
 import { extractIntake, listMissingIntake } from "./agent/extraction.js";
 import { dispatchHandler, type HandlerOutcome } from "./agent/handlers/index.js";
+import { applySemanticSafetyNet } from "./agent/semantic-enrichment.js";
 import { summariseBatch } from "./agent/summary.js";
 import { batchAnchor } from "./agent/utils.js";
 import type { InboxItem, ItemOutput } from "./types.js";
@@ -87,7 +88,14 @@ async function triageItem(item: InboxItem, anchor: Date): Promise<ItemOutput> {
   return withItemContext(item.id, async () => {
     const errors: string[] = [];
     const intake = extractIntake(item);
-    const initial = classifyItem(item, intake);
+
+    // 1. Deterministic keyword classifier produces the baseline decision.
+    const keywordDecision = classifyItem(item, intake);
+
+    // 2. Optional LLM semantic safety net. No-op when no API key is
+    //    set or when the keyword classifier already caught an urgent
+    //    signal. Only upgrades (never downgrades) the decision.
+    const initial = await applySemanticSafetyNet(item, keywordDecision);
 
     let outcome: HandlerOutcome;
     try {
