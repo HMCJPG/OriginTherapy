@@ -15,7 +15,18 @@
  * response) is caught and downgrades silently to the deterministic
  * path - the triage run itself never fails because of a summary
  * issue.
+ *
+ * `dotenv/config` is side-effect imported so a developer's local
+ * `.env` is picked up automatically. Missing `.env` is fine - the
+ * deterministic path just runs.
  */
+
+// Load .env explicitly with override so an empty `ANTHROPIC_API_KEY=`
+// already in the parent shell doesn't shadow a real value in .env.
+// (dotenv v17+ skips injection when the key is "already defined" even
+// when the existing value is the empty string.)
+import { config as dotenvConfig } from "dotenv";
+dotenvConfig({ override: true, quiet: true });
 
 import { URGENCY } from "./constants.js";
 import type { ItemOutput, Urgency } from "../types.js";
